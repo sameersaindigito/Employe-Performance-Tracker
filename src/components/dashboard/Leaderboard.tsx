@@ -70,9 +70,9 @@ export function Leaderboard() {
 
   // Rank is assigned to every designer with a computed score (i.e. any
   // rating at all), in the score-descending order useLeaderboard already
-  // sorted them into — not gated by the stricter Designer-of-the-Month
-  // eligibility bar (5+ tasks, 3.0+ rating). A designer with no rating at
-  // all has nothing to rank by, so they still fall back to "—".
+  // sorted them into — not gated by Designer of the Month's own (separate,
+  // stricter) eligibility rules. A designer with no rating at all has
+  // nothing to rank by, so they still fall back to "—".
   let rankCounter = 0;
   const ranked = leaderboard.map((d) => {
     const hasScore = d.weightedScore !== null;
@@ -113,6 +113,7 @@ export function Leaderboard() {
               <Th>Team Leader</Th>
               <Th>Tasks</Th>
               <Th>Avg Rating</Th>
+              <Th>Productivity</Th>
               <Th>Score</Th>
               <Th>Status</Th>
             </tr>
@@ -159,6 +160,13 @@ export function Leaderboard() {
                 <Td>
                   <span className="font-semibold text-[#F0F0F5]">
                     {d.averageRating !== null ? d.averageRating.toFixed(2) : '—'}
+                  </span>
+                </Td>
+
+                {/* Productivity % — billed hours ÷ period capacity, feeds the score */}
+                <Td>
+                  <span className={d.productivityPct !== null ? 'text-[#F0F0F5]' : 'text-[#8B8B9E]'}>
+                    {d.productivityPct !== null ? `${d.productivityPct.toFixed(0)}%` : '—'}
                   </span>
                 </Td>
 

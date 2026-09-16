@@ -64,7 +64,7 @@ export function FilterBar() {
       <Select
         value={filters.designer}
         onChange={(v) => setFilters({ designer: v })}
-        placeholder="All Designers"
+        placeholder="All Resources"
         options={designers.map((d) => ({ value: d, label: d }))}
         className="min-w-[150px]"
       />

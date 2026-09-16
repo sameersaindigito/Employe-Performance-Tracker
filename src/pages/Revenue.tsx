@@ -5,12 +5,14 @@ import {
   computeDesignerRevenue,
   computeCategoryRevenue,
   resolveRevenueAmount,
-  scopeRevenueItems,
+  scopeRevenueItemsForMonth,
+  scopeRevenueItemsForCategory,
+  filterTasksByMonth,
   parseMonthRange,
-  monthIncludes,
 } from '../lib/revenueAttribution';
 import { PageShell } from '../components/layout/PageShell';
 import { Card } from '../components/ui/Card';
+import { DesignerDetailSection } from '../components/shared/DesignerDetailSection';
 import {
   BarChart,
   Bar,
@@ -24,7 +26,7 @@ import {
   Pie,
   Legend,
 } from 'recharts';
-import { DollarSign, Clock, TrendingUp, Award, RefreshCw, Users, User, Wallet } from 'lucide-react';
+import { DollarSign, Clock, TrendingUp, Award, RefreshCw, Users, Wallet, Percent } from 'lucide-react';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -203,6 +205,8 @@ interface RevenueFilters {
   leader: string;
   category: string;
   designer: string;
+  client: string;    // '' = All Clients
+  projectId: string; // '' = All Project IDs
 }
 
 interface FilterBarProps {
@@ -212,12 +216,14 @@ interface FilterBarProps {
   leaders: string[];
   categories: string[];
   designers: string[];
+  clients: string[];
+  projectIds: string[];
 }
 
 function RevenueFilterBar({
-  filters, onChange, availableMonths, leaders, categories, designers,
+  filters, onChange, availableMonths, leaders, categories, designers, clients, projectIds,
 }: FilterBarProps) {
-  const hasActiveFilter = filters.month || filters.leader || filters.category || filters.designer;
+  const hasActiveFilter = filters.month || filters.leader || filters.category || filters.designer || filters.client || filters.projectId;
   const selectCls = 'bg-[#111118] border border-[#1E1E2E] text-sm rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-[#6366F1] text-[#F0F0F5]';
 
   return (
@@ -248,7 +254,7 @@ function RevenueFilterBar({
         onChange={(e) => onChange({ designer: e.target.value, leader: '' })}
         className={`${selectCls} min-w-[160px]`}
       >
-        <option value="">All Designers</option>
+        <option value="">All Resources</option>
         {designers.map((d) => <option key={d} value={d}>{d}</option>)}
       </select>
 
@@ -261,9 +267,32 @@ function RevenueFilterBar({
         {categories.map((c) => <option key={c} value={c}>{c}</option>)}
       </select>
 
+      {/* Client and Project ID map 1:1 to a RevenueItem row — simple exact-
+          match row filters, no proportional hours-share splitting needed
+          (unlike Designer/Category, which can share a project). Independent
+          of each other (both apply as AND when set), unlike Leader/Designer
+          which clear each other. */}
+      <select
+        value={filters.client}
+        onChange={(e) => onChange({ client: e.target.value })}
+        className={`${selectCls} min-w-[160px]`}
+      >
+        <option value="">All Clients</option>
+        {clients.map((c) => <option key={c} value={c}>{c}</option>)}
+      </select>
+
+      <select
+        value={filters.projectId}
+        onChange={(e) => onChange({ projectId: e.target.value })}
+        className={`${selectCls} min-w-[150px]`}
+      >
+        <option value="">All Project IDs</option>
+        {projectIds.map((p) => <option key={p} value={p}>{p}</option>)}
+      </select>
+
       {hasActiveFilter && (
         <button
-          onClick={() => onChange({ month: '', leader: '', category: '', designer: '' })}
+          onClick={() => onChange({ month: '', leader: '', category: '', designer: '', client: '', projectId: '' })}
           className="text-xs text-[#8B8B9E] hover:text-[#F0F0F5] transition-colors flex items-center gap-1 px-2 py-1.5 rounded-md hover:bg-[#1E1E2E]"
         >
           ✕ Clear
@@ -293,6 +322,8 @@ export function Revenue() {
     leader: '',
     category: '',
     designer: '',
+    client: '',
+    projectId: '',
   });
   // Tracks whether we've set the initial default month yet
   const [defaultMonthSet, setDefaultMonthSet] = useState(false);
@@ -332,25 +363,80 @@ export function Revenue() {
     return [...months].sort().reverse();
   }, [allRevenueData]);
 
-  // Bug 3a / Fix 1: month/leader filtering happens client-side against the
-  // SAME list the default month and dropdown were computed from — no second
-  // round trip whose own filter matching could disagree with the client's.
+  // Client and Project ID are simple exact-match row filters — a project
+  // belongs to exactly one client and has exactly one ID, so (unlike
+  // Designer/Category, which can share a project across multiple people/
+  // categories) narrowing to one just drops the OTHER projects entirely,
+  // with no proportional-split math needed. Safe to fold into the same
+  // "hours pool" every subsequent step reads from (unlike Leader/Designer,
+  // which are person-level dimensions that can cut across a shared
+  // project's denominator — see the note below where those apply instead).
+  const clientProjectScopedTasks = useMemo(() => {
+    let t = allTasks;
+    if (filters.client) t = t.filter((task) => task.clientName === filters.client);
+    if (filters.projectId) t = t.filter((task) => task.projectId.trim() === filters.projectId);
+    return t;
+  }, [allTasks, filters.client, filters.projectId]);
+
+  const clientProjectScopedRevenue = useMemo(() => {
+    let r = allRevenueData;
+    if (filters.client) r = r.filter((row) => row.clientName === filters.client);
+    if (filters.projectId) r = r.filter((row) => row.projectId.trim() === filters.projectId);
+    return r;
+  }, [allRevenueData, filters.client, filters.projectId]);
+
+  // Tasks restricted to the active month — the hours pool every subsequent
+  // scoping step (category scaling, designer attribution) uses so its own
+  // "total hours" denominator means "hours within the selected month," not
+  // "hours ever." "All Months" uses every task, unchanged.
+  const monthScopedTasks = useMemo(
+    () => filterTasksByMonth(clientProjectScopedTasks, filters.month),
+    [clientProjectScopedTasks, filters.month]
+  );
+  // Further restricted to the active category too, for feeding
+  // computeDesignerRevenue/computeCategoryRevenue with the correct joint
+  // (month × category) hours denominator once both filters are active.
+  const monthAndCategoryScopedTasks = useMemo(
+    () => (filters.category ? monthScopedTasks.filter((t) => t.category === filters.category) : monthScopedTasks),
+    [monthScopedTasks, filters.category]
+  );
+
+  // Revenue rows scaled by month, then by category — composing two
+  // proportional hours-share splits sequentially. Neither is a project-
+  // inclusion filter (project-level "is this row month/category not
+  // matching, so scrap the WHOLE row" — the old category model, and the
+  // month model before its own fix): a project spanning multiple
+  // months/categories would show its FULL revenue under each one, double-
+  // (or triple-) counting it. Selecting "Graphic Design" on a project that's
+  // mostly IT Operations now shows just Graphic Design's ~4% share, not the
+  // project's full total.
   //
-  // Month matching is range-aware (monthIncludes) — a row whose month is
-  // "2026-06 - 2026-08" must still match a "2026-07" filter selection, not
-  // just an exact string match, consistent with the backend's own
-  // range-inclusive filtering in getRevenueData.
+  // Order matters: category is scaled using monthScopedTasks (not allTasks),
+  // so its hours denominator already means "hours within the selected
+  // month" — composing the two splits sequentially then yields the correct
+  // JOINT share (month × category), not an independent double-discount. See
+  // scopeRevenueItemsForCategory's doc for the worked-out math. "No filter"
+  // on either dimension returns rows unchanged, so a single active filter
+  // behaves exactly as if the other were "All".
   //
-  // Category is deliberately NOT filtered here on RevenueItem.category — see
-  // categoryProjectIds below for why, and where category filtering actually
-  // happens instead.
+  // This is also the shared "company-wide, leader-independent" baseline used
+  // by both the leader-filtered view (below) and the % of Company Total card.
+  const monthCategoryScopedData = useMemo(() => {
+    let data = scopeRevenueItemsForMonth(clientProjectScopedRevenue, clientProjectScopedTasks, filters.month);
+    data = scopeRevenueItemsForCategory(data, monthScopedTasks, filters.category);
+    return data;
+  }, [clientProjectScopedRevenue, clientProjectScopedTasks, monthScopedTasks, filters.month, filters.category]);
+
+  // Leader filtering happens client-side against the SAME list the default
+  // month and dropdown were computed from — no second round trip whose own
+  // filter matching could disagree with the client's. Leader row-inclusion
+  // is safe to apply AFTER month/category scaling since it only narrows
+  // WHICH rows to display, not the hours pool those scalings were computed
+  // from (each row's leader field is preserved unchanged through scaling).
   const filteredData = useMemo(() => {
-    return allRevenueData.filter((r) => {
-      if (filters.month && !monthIncludes(r.month, filters.month)) return false;
-      if (filters.leader && r.leader !== filters.leader) return false;
-      return true;
-    });
-  }, [allRevenueData, filters.month, filters.leader]);
+    if (!filters.leader) return monthCategoryScopedData;
+    return monthCategoryScopedData.filter((r) => r.leader === filters.leader);
+  }, [monthCategoryScopedData, filters.leader]);
 
   // Bug 1: option lists must always show the FULL set of values, never just
   // what's left after the current selection narrows the data — otherwise
@@ -377,61 +463,51 @@ export function Revenue() {
     () => [...new Set(allTasks.map((t) => t.designerName).filter(Boolean))].sort(),
     [allTasks]
   );
+  // Client / Project ID options — same "always the full unfiltered set" rule
+  // as every other dropdown here (Bug 1), so picking one never makes the
+  // other's remaining options vanish.
+  const clients = useMemo(
+    () => [...new Set(allRevenueData.map((r) => r.clientName).filter(Boolean))].sort(),
+    [allRevenueData]
+  );
+  const projectIds = useMemo(
+    () => [...new Set(allRevenueData.map((r) => r.projectId.trim()).filter(Boolean))].sort(),
+    [allRevenueData]
+  );
 
-  // Same reasoning as the category dropdown: a project can span multiple
-  // categories, so "does this project belong to the selected category" must
-  // be answered from Task-level data (any task on the project with that
-  // category), not RevenueItem.category — otherwise selecting "IT Operations"
-  // would incorrectly exclude a project's ENTIRE revenue row just because the
-  // backend happened to stamp it with a different category, even though real
-  // IT Operations hours were logged on it. This mirrors designerProjects
-  // below: a project-inclusion filter, not a per-category dollar split — the
-  // same model Leader/Designer filtering already uses on this page.
-  const categoryProjectIds = useMemo(() => {
-    if (!filters.category) return null;
-    return new Set(
+  // ── Apply client-side designer filter (still project-level inclusion —
+  // selecting a designer shows every project they touched in full, with the
+  // separate Designer Contribution panel below doing the actual per-designer
+  // dollar split; unlike category, this filter's model wasn't reported as
+  // broken and is left as-is) ──
+  const visibleData = useMemo(() => {
+    if (!filters.designer) return filteredData;
+    const designerProjects = new Set(
       allTasks
-        .filter((t) => t.category === filters.category)
+        .filter((t) => t.designerName === filters.designer)
         .map((t) => t.projectId.trim())
     );
-  }, [allTasks, filters.category]);
-
-  // ── Apply client-side designer + category filters (both are project-level
-  // inclusion filters over revenue rows, since revenue is per-project) ──
-  const visibleData = useMemo(() => {
-    let data = filteredData;
-    if (filters.designer) {
-      const designerProjects = new Set(
-        allTasks
-          .filter((t) => t.designerName === filters.designer)
-          .map((t) => t.projectId.trim())
-      );
-      data = data.filter((r) => designerProjects.has(r.projectId.trim()));
-    }
-    if (categoryProjectIds) {
-      data = data.filter((r) => categoryProjectIds.has(r.projectId.trim()));
-    }
-    return data;
-  }, [filteredData, filters.designer, allTasks, categoryProjectIds]);
+    return filteredData.filter((r) => designerProjects.has(r.projectId.trim()));
+  }, [filteredData, filters.designer, allTasks]);
 
   // ── Pre-compute designer revenues ──
-  // Revenue rows are scoped to the active month (and now category, via
-  // categoryProjectIds — not RevenueItem.category) so the attribution KPIs
-  // reconcile with the Total Revenue KPI below. Tasks are deliberately NOT
-  // scoped: each project's hours denominator must stay whole, or shares get
-  // inflated. Leader/designer filters are excluded here too — they select
-  // which rows to DISPLAY, not which hours count toward a project total.
-  const scopedRevenueData = useMemo(() => {
-    let data = scopeRevenueItems(allRevenueData, { month: filters.month });
-    if (categoryProjectIds) {
-      data = data.filter((r) => categoryProjectIds.has(r.projectId.trim()));
-    }
-    return data;
-  }, [allRevenueData, filters.month, categoryProjectIds]);
-
+  // Revenue rows are scoped to the active month AND category (proportional
+  // split, via monthCategoryScopedData) so the attribution KPIs reconcile
+  // with the Total Revenue KPI below. Leader/designer filters are excluded
+  // here — they select which rows to DISPLAY, not which hours count toward a
+  // project total.
   const designerRevenues = useMemo(
-    () => computeDesignerRevenue(allTasks, scopedRevenueData),
-    [allTasks, scopedRevenueData]
+    () => computeDesignerRevenue(monthAndCategoryScopedTasks, monthCategoryScopedData),
+    [monthAndCategoryScopedTasks, monthCategoryScopedData]
+  );
+
+  // Company-wide Total Revenue with the SAME month/category filters applied
+  // but ignoring Leader — the baseline the "% of Company Total" card compares
+  // a selected leader's team total against. Verifiable by hand: clearing just
+  // the Leader filter reproduces this exact figure on the Total Revenue KPI.
+  const companyTotalRevenue = useMemo(
+    () => monthCategoryScopedData.reduce((s, r) => s + resolveRevenueAmount(r), 0),
+    [monthCategoryScopedData]
   );
 
   // ── KPI calculations ──
@@ -458,16 +534,42 @@ export function Revenue() {
   }, [visibleData]);
 
   // ── Part 6d: Team total via attribution sum (not raw row sum) ──
+  //
+  // A designer can work under more than one leader (different projects,
+  // different — sometimes informally-worded — teamLeader values, e.g. "Stuti
+  // Sharma" vs. "Handled by Stuti"; these are two DISTINCT, unrelated raw
+  // values compared by exact string equality, never merged). The earlier
+  // version here used that exact-match check only as a yes/no MEMBERSHIP
+  // gate — "does this designer have at least one task under this leader?" —
+  // but then attributed the designer's ENTIRE cross-leader revenueContribution
+  // (every project they've ever touched, from designerRevenues) to this
+  // leader's team. A designer with one task under Leader A and a large,
+  // unrelated project entirely under Leader B would have Leader B's whole
+  // project revenue and hours leak into Leader A's team total.
+  //
+  // Fixed by restricting each designer's counted projects to only the ones
+  // where they actually have a task tagged with THIS exact leader, and
+  // re-summing designerShare from just those — not reusing the leader-
+  // agnostic revenueContribution/projects total.
   const teamBreakdown = useMemo(() => {
     if (!filters.leader) return null;
 
-    // Filter to designers who have tasks under this leader
     const breakdown = designerRevenues
-      .filter((dr) => {
-        return allTasks.some(
-          (t) => t.designerName === dr.designerName && t.teamLeader === filters.leader
-        ) && dr.revenueContribution > 0;
+      .map((dr) => {
+        const leaderProjectIds = new Set(
+          allTasks
+            .filter((t) => t.designerName === dr.designerName && t.teamLeader === filters.leader)
+            .map((t) => t.projectId.trim()),
+        );
+        const projects = dr.projects.filter((p) => leaderProjectIds.has(p.projectId.trim()));
+        return {
+          designerName: dr.designerName,
+          teamLeader: dr.teamLeader,
+          revenueContribution: Math.round(projects.reduce((s, p) => s + p.designerShare, 0) * 100) / 100,
+          projects,
+        };
       })
+      .filter((dr) => dr.revenueContribution > 0)
       .sort((a, b) => b.revenueContribution - a.revenueContribution);
 
     // Team total = sum of individual contributions (guarantees leader KPI === sum of table rows)
@@ -479,18 +581,6 @@ export function Revenue() {
 
     return { teamTotal, teamHours, breakdown };
   }, [filters.leader, designerRevenues, allTasks]);
-
-  // ── Part 5 / 6c: Single designer breakdown ──
-  const designerBreakdown = useMemo(() => {
-    if (!filters.designer) return null;
-    const drEntry = designerRevenues.find((dr) => dr.designerName === filters.designer);
-    const projects = drEntry?.projects ?? [];
-    return {
-      contribution: drEntry?.revenueContribution ?? 0,
-      hours: projects.reduce((h, p) => h + p.designerHours, 0),
-      projects,
-    };
-  }, [filters.designer, designerRevenues]);
 
   // ── Chart: Revenue by Leader ──
   const leaderChartData = useMemo(() => {
@@ -518,17 +608,24 @@ export function Revenue() {
   // Scoped to visibleData's own project set (not a separate task/category
   // filter) so this always sums to exactly the Total Revenue KPI, under any
   // combination of month/leader/category/designer filters.
+  //
+  // Uses monthAndCategoryScopedTasks (not monthScopedTasks): visibleData's
+  // revenue is now ALREADY category-scaled when a category filter is active
+  // (Fix 1), so re-splitting it by every category present (including ones
+  // outside the filter) would wrongly redistribute an already-Graphic-Design
+  // -only figure back across Web Design/IT Operations too. Restricting tasks
+  // to the same category the revenue was scaled by correctly shows "100% of
+  // the filtered category" and reconciles with the KPI.
   const visibleProjectIds = useMemo(
     () => new Set(visibleData.map((r) => r.projectId.trim())),
     [visibleData]
   );
   const categoryChartData = useMemo(() => {
-    const relevantTasks = allTasks.filter((t) => visibleProjectIds.has(t.projectId?.trim()));
-    const relevantRevenue = allRevenueData.filter((r) => visibleProjectIds.has(r.projectId?.trim()));
-    return computeCategoryRevenue(relevantTasks, relevantRevenue)
+    const relevantTasks = monthAndCategoryScopedTasks.filter((t) => visibleProjectIds.has(t.projectId?.trim()));
+    return computeCategoryRevenue(relevantTasks, visibleData)
       .map((c) => ({ name: c.category, value: c.revenueContribution }))
       .sort((a, b) => b.value - a.value);
-  }, [allTasks, allRevenueData, visibleProjectIds]);
+  }, [monthAndCategoryScopedTasks, visibleData, visibleProjectIds]);
 
   // ── Chart: Revenue by Payment Channel (Part 6b) ──
   // Blank paymentChannel → 'Unspecified' (not dropped, so total reconciles)
@@ -579,6 +676,8 @@ export function Revenue() {
         leaders={leaders}
         categories={categories}
         designers={designers}
+        clients={clients}
+        projectIds={projectIds}
       />
 
       {/* ── Part 6d: Team Total Revenue (leader selected) ── */}
@@ -591,6 +690,20 @@ export function Revenue() {
               subtitle={`· ${formatHours(teamBreakdown.teamHours)} · sum of ${teamBreakdown.breakdown.length} designer contribution(s)`}
               icon={<Users size={18} />}
               iconColor="text-indigo-400"
+              loading={loading}
+            />
+            <RevenueKPICard
+              title="% of Company Total"
+              value={
+                loading
+                  ? '—'
+                  : companyTotalRevenue > 0
+                  ? `${((teamBreakdown.teamTotal / companyTotalRevenue) * 100).toFixed(1)}%`
+                  : '—'
+              }
+              subtitle={`${formatCurrency(teamBreakdown.teamTotal)} of ${formatCurrency(companyTotalRevenue)} company-wide`}
+              icon={<Percent size={18} />}
+              iconColor="text-amber-400"
               loading={loading}
             />
           </div>
@@ -653,67 +766,18 @@ export function Revenue() {
         </div>
       )}
 
-      {/* ── Part 6c: Single Designer Billing View ── */}
-      {filters.designer && designerBreakdown && (
-        <div className="mb-6 space-y-4">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <RevenueKPICard
-              title={`Revenue Contribution — ${filters.designer}`}
-              value={loading ? '—' : formatCurrency(designerBreakdown.contribution)}
-              subtitle={`· ${formatHours(designerBreakdown.hours)} · proportional share across ${designerBreakdown.projects.length} project(s)`}
-              icon={<User size={18} />}
-              iconColor="text-purple-400"
-              loading={loading}
-            />
-          </div>
-
-          {designerBreakdown.projects.length > 0 && (
-            <Card className="fade-in">
-              <h2 className="text-sm font-semibold text-[#F0F0F5] mb-1 flex items-center gap-2">
-                <User size={15} className="text-purple-400" />
-                Project-level Revenue Audit — {filters.designer}
-              </h2>
-              <p className="text-xs text-[#8B8B9E] mb-4">
-                Share = (designer hrs ÷ project total hrs) × project revenue · Verify by hand: rows sum to the KPI above
-              </p>
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b border-[#1E1E2E]">
-                      {['Project ID', 'Client', 'Designer Hrs', 'Project Hrs', 'Project Revenue', 'Designer Share'].map((h) => (
-                        <th key={h} className="text-left text-xs font-medium text-[#8B8B9E] uppercase tracking-wider py-3 px-3 whitespace-nowrap">
-                          {h}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {designerBreakdown.projects.map((p) => (
-                      <tr key={p.projectId} className="border-b border-[#1E1E2E]/50 hover:bg-[#1E1E2E]/40 transition-colors">
-                        <td className="py-3 px-3 text-[#8B8B9E] font-mono text-xs">{p.projectId || '—'}</td>
-                        <td className="py-3 px-3 text-[#F0F0F5]">{p.clientName || '—'}</td>
-                        <td className="py-3 px-3 text-[#8B8B9E]">{p.designerHours.toFixed(1)} h</td>
-                        <td className="py-3 px-3 text-[#8B8B9E]">{p.projectTotalHours.toFixed(1)} h</td>
-                        <td className="py-3 px-3 text-[#F0F0F5]">
-                          {p.projectTotalRevenue > 0 ? formatCurrency(p.projectTotalRevenue) : <span className="text-[#8B8B9E]">Not billed</span>}
-                        </td>
-                        <td className="py-3 px-3 text-emerald-400 font-semibold">
-                          {p.designerShare > 0 ? formatCurrency(p.designerShare) : <span className="text-[#8B8B9E]">—</span>}
-                        </td>
-                      </tr>
-                    ))}
-                    {/* Reconciliation footer */}
-                    <tr className="border-t border-[#2E2E3E] bg-[#1E1E2E]/30">
-                      <td colSpan={5} className="py-2 px-3 text-xs font-semibold text-[#8B8B9E]">Total</td>
-                      <td className="py-2 px-3 text-xs font-semibold text-emerald-400">
-                        {formatCurrency(designerBreakdown.contribution)}
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            </Card>
-          )}
+      {/* ── Single Designer Billing View — Revenue Contribution, the Audit
+          table, and Productivity all share one "View by" control. ── */}
+      {filters.designer && (
+        <div className="mb-6">
+          <DesignerDetailSection
+            designerName={filters.designer}
+            allTasks={allTasks}
+            revenueItems={allRevenueData}
+            topLevelMonth={filters.month}
+            loading={loading}
+            showAuditTable
+          />
         </div>
       )}
 

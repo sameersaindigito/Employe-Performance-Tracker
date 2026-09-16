@@ -2,32 +2,34 @@ import { useMemo } from 'react';
 import { useAppContext } from '../context/AppContext';
 import type { DesignerStats } from '../types';
 import { statusFromRating } from '../lib/ratings';
-import { computeDesignerRevenue, scopeRevenueItems } from '../lib/revenueAttribution';
+import { computeProductivityMap } from '../lib/productivity';
 import { computeWeightedDesignerScore } from '../lib/designerOfMonth';
 
-/** Must match designerOfMonth.ts thresholds */
-const ELIGIBLE_MIN_TASKS = 5;
-const ELIGIBLE_MIN_RATING = 3.0;
+/** "YYYY-MM" filter value -> a Date anchored to that month. */
+function monthToDate(month: string): Date {
+  if (!month) return new Date();
+  const [y, m] = month.split('-').map(Number);
+  return new Date(y, (m || 1) - 1, 1);
+}
 
 export function useLeaderboard(): DesignerStats[] {
-  const { tasks, allTasks, filters, revenueItems } = useAppContext();
+  const { tasks, filters } = useAppContext();
 
-  // Same billing-aware attribution DOTM/IT Ops Champion use: hours-denominator
-  // comes from the COMPLETE task list (so a project's hours-share math never
-  // gets skewed by whatever's currently filtered), while the revenue rows
-  // themselves are scoped to the active month/category — matching what those
-  // award cards do, for one consistent notion of "revenue right now."
-  const scopedRevenue = useMemo(
-    () => scopeRevenueItems(revenueItems, { month: filters.month, category: filters.category }),
-    [revenueItems, filters.month, filters.category],
+  // The Leaderboard's Productivity/Score is always monthly — same as
+  // Designer of the Month / IT Ops Champion — anchored to whichever month
+  // the top-level Month filter has selected (or "now" for "All Months"). A
+  // separate global Daily/Weekly/Yearly selector used to sit alongside the
+  // Month filter here, but the two independently controlled the same time
+  // dimension and produced inconsistent results; that control has been
+  // removed in favor of a "View by" selector shared across the whole
+  // designer-detail section (src/components/shared/DesignerDetailSection.tsx),
+  // which is fully local and can't collide with this or any other page-level filter.
+  const reference = useMemo(() => monthToDate(filters.month), [filters.month]);
+
+  const productivityMap = useMemo(
+    () => computeProductivityMap(tasks, 'monthly', reference),
+    [tasks, reference],
   );
-  const revenueMap = useMemo(() => {
-    const map = new Map<string, number>();
-    computeDesignerRevenue(allTasks, scopedRevenue).forEach((r) => {
-      map.set(r.designerName, r.revenueContribution);
-    });
-    return map;
-  }, [allTasks, scopedRevenue]);
 
   return useMemo(() => {
     // ── 1. Aggregate per designer ─────────────────────────────────────────
@@ -81,42 +83,38 @@ export function useLeaderboard(): DesignerStats[] {
         if (count > maxCount) { maxCount = count; primaryLeader = leader; }
       });
 
-      // Eligible = 5+ tasks AND avgRating >= 3.0 — the Designer-of-the-Month
-      // award threshold. Kept as a distinct flag (still meaningful: "would
-      // this designer qualify for DOTM"), but no longer gates whether the
-      // Leaderboard shows a Score/Rank — a general roster table shouldn't go
-      // blank for every designer just because nobody happens to clear DOTM's
-      // stricter monthly-award bar yet.
-      const eligible =
-        data.totalTasks >= ELIGIBLE_MIN_TASKS &&
-        avgRating !== null &&
-        avgRating >= ELIGIBLE_MIN_RATING;
-
       stats.push({
         name,
         teamLeader: primaryLeader,
         totalTasks: data.totalTasks,
         averageRating: avgRating,
-        weightedScore: null, // computed below, once maxRevenue/maxTasks are known
-        eligible,
+        weightedScore: null, // computed below, once maxProductivity is known
+        // Productivity doesn't depend on having a rating at all (it's purely
+        // hours ÷ capacity, with a natural zero — unlike a rating, which has
+        // no sensible "0" default) — populate it for EVERY designer here,
+        // not just the rated ones scoring below, defaulting to 0 for anyone
+        // with no hours logged in the period. Otherwise a designer with real
+        // logged hours but no rating yet would show "—" for Productivity
+        // too, even though it's a perfectly real, checkable number
+        // independent of Score — and this also matches what Score itself
+        // assumes for a missing lookup (0), so the two numbers never disagree.
+        productivityPct: productivityMap.get(name) ?? 0,
         status: statusFromRating(avgRating),
       });
     });
 
     // ── 3. Score every rated designer with the SAME formula as Designer of
-    // the Month (rating + revenue + task-count, weighted 0.5/0.3/0.2),
-    // normalized against the max among designers actually shown here — i.e.
-    // everyone with a rating, NOT gated by DOTM's stricter award threshold.
-    // A designer with no rating at all has nothing to score — stays null.
+    // the Month (rating + productivity, weighted 0.6/0.4), normalized
+    // against the max among designers actually shown here — i.e. everyone
+    // with a rating, NOT gated by DOTM's stricter award threshold.
+    // A designer with no rating at all has nothing to score — stays null
+    // (their Productivity % above still renders, only Score/Rank don't).
     const scored = stats.filter((d) => d.averageRating !== null);
-    const maxRevenue = Math.max(0, ...scored.map((d) => revenueMap.get(d.name) ?? 0));
-    const maxTasks = Math.max(0, ...scored.map((d) => d.totalTasks));
+    const maxProductivity = Math.max(0, ...scored.map((d) => productivityMap.get(d.name) ?? 0));
 
     scored.forEach((d) => {
-      const rev = revenueMap.get(d.name) ?? 0;
-      d.weightedScore = computeWeightedDesignerScore(
-        d.averageRating ?? 0, rev, maxRevenue, d.totalTasks, maxTasks,
-      );
+      const prod = productivityMap.get(d.name) ?? 0;
+      d.weightedScore = computeWeightedDesignerScore(d.averageRating ?? 0, prod, maxProductivity);
     });
 
     // ── 4. Sort: every scored designer by weightedScore desc, unscored last ─
@@ -132,5 +130,5 @@ export function useLeaderboard(): DesignerStats[] {
       // Both unscored (no rating yet): more tasks first, as a stable fallback
       return b.totalTasks - a.totalTasks;
     });
-  }, [tasks, revenueMap]);
+  }, [tasks, productivityMap]);
 }

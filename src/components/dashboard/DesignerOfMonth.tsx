@@ -1,23 +1,28 @@
 import { useMemo } from 'react';
 import { useAppContext } from '../../context/AppContext';
-import { getDesignerOfMonth } from '../../lib/designerOfMonth';
-import { scopeRevenueItems } from '../../lib/revenueAttribution';
+import { getDesignerOfMonth, PRODUCTIVITY_ELIGIBILITY_FLOOR } from '../../lib/designerOfMonth';
 import { Card } from '../ui/Card';
-import { Award, Star, ClipboardList, Users, TrendingUp } from 'lucide-react';
+import { Award, Star, ClipboardList, Users, Gauge } from 'lucide-react';
+
+/** "YYYY-MM" filter value -> a Date anchored to that month, for productivity's period math. */
+function monthToDate(month: string): Date {
+  if (!month) return new Date();
+  const [y, m] = month.split('-').map(Number);
+  return new Date(y, (m || 1) - 1, 1);
+}
 
 export function DesignerOfMonth() {
-  const { tasks, allTasks, filters, loading, revenueItems } = useAppContext();
+  const { tasks, filters, loading } = useAppContext();
 
-  // Revenue is scoped to the month/category being awarded; hours denominators
-  // come from allTasks so each project's total stays whole.
-  const scopedRevenue = useMemo(
-    () => scopeRevenueItems(revenueItems, { month: filters.month, category: filters.category }),
-    [revenueItems, filters.month, filters.category],
-  );
+  // Part 4: Designer of the Month stays a MONTHLY award regardless of the
+  // Leaderboard's period selector — always 'monthly', anchored to whichever
+  // month the Dashboard's Month filter has selected (falling back to the
+  // current month if "All Months" is active).
+  const reference = useMemo(() => monthToDate(filters.month), [filters.month]);
 
   const winner = useMemo(
-    () => getDesignerOfMonth(tasks, scopedRevenue, allTasks),
-    [tasks, scopedRevenue, allTasks],
+    () => getDesignerOfMonth(tasks, 'monthly', reference),
+    [tasks, reference],
   );
 
   if (loading) {
@@ -40,7 +45,7 @@ export function DesignerOfMonth() {
           No eligible designer this month
         </p>
         <p className="text-[#8B8B9E] text-xs">
-          Minimum 5 tasks with 3.0+ rating required · Designers with a Client Lost project are ineligible
+          Web Design category · Client Lost designers ineligible · Productivity must be above {PRODUCTIVITY_ELIGIBILITY_FLOOR}% · highest Rating + Productivity wins
         </p>
       </Card>
     );
@@ -72,14 +77,24 @@ export function DesignerOfMonth() {
             <div className="flex items-center gap-1.5 text-amber-400">
               <Star size={14} fill="currentColor" />
               <span className="text-sm font-semibold">
-                {winner.averageRating?.toFixed(2)} / 5
+                {winner.averageRating !== null ? `${winner.averageRating.toFixed(2)} / 5` : 'N/A'}
               </span>
               <span className="text-[#8B8B9E] text-xs font-normal">avg</span>
             </div>
 
+            {winner.productivityPct !== null && (
+              <div className="flex items-center gap-1.5 text-emerald-400">
+                <Gauge size={14} />
+                <span className="text-sm font-semibold">
+                  {winner.productivityPct.toFixed(0)}%
+                </span>
+                <span className="text-[#8B8B9E] text-xs font-normal">productivity</span>
+              </div>
+            )}
+
             {winner.weightedScore !== null && (
               <div className="flex items-center gap-1.5 text-indigo-400">
-                <TrendingUp size={14} />
+                <Award size={14} />
                 <span className="text-sm font-semibold">
                   {winner.weightedScore.toFixed(2)}
                 </span>

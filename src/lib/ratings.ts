@@ -63,6 +63,3 @@ export function ratingBarColor(avg: number | null): string {
   if (avg >= 2.5) return '#F59E0B';
   return '#EF4444';
 }
-
-/** Minimum tasks a designer must have to be eligible for awards */
-export const MIN_TASKS_THRESHOLD = 3;

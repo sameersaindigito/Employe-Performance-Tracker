@@ -2,8 +2,10 @@ import { useAppContext } from '../context/AppContext';
 import { PageShell } from '../components/layout/PageShell';
 import { FilterBar } from '../components/dashboard/FilterBar';
 import { KPIGrid } from '../components/dashboard/KPIGrid';
+import { DesignerDetailCard } from '../components/dashboard/DesignerDetailCard';
 import { DesignerOfMonth } from '../components/dashboard/DesignerOfMonth';
 import { ITOperationsChampion } from '../components/dashboard/ITOperationsChampion';
+import { ThisWeekLeader } from '../components/dashboard/ThisWeekLeader';
 import { Leaderboard } from '../components/dashboard/Leaderboard';
 import { RecentTasksTable } from '../components/dashboard/RecentTasksTable';
 import { RatingsBarChart } from '../components/charts/RatingsBarChart';
@@ -49,10 +51,20 @@ export function Dashboard() {
           {/* KPI Grid */}
           <KPIGrid />
 
-          {/* Designer of Month + IT Operations Champion banners */}
+          {/* Fix 3: Productivity + Revenue + Rating together, when a
+              specific Designer is selected via the filter above */}
+          <DesignerDetailCard />
+
+          {/* Designer of Month + IT Operations Champion banners — the
+              official monthly awards, unaffected by the period selector */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
             <DesignerOfMonth />
             <ITOperationsChampion />
+          </div>
+
+          {/* Part 4: live "This Week" standing — explicitly not an award */}
+          <div className="mb-6">
+            <ThisWeekLeader />
           </div>
 
           {/* Charts Row 1 */}

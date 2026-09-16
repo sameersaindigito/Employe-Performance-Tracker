@@ -6,7 +6,7 @@ import type { Task, RevenueItem } from '../types';
 export interface DesignerProjectShare {
   projectId: string;
   clientName: string;
-  /** Hours this designer logged on this project (punchedHours → actualEfforts fallback) */
+  /** Hours this designer logged on this project — punchedHours (approved/billed) ONLY */
   designerHours: number;
   /** Total hours across ALL designers on this project */
   projectTotalHours: number;
@@ -39,6 +39,7 @@ export interface DesignerRevenue {
  *   "6 Hours 30 Minutes"   → 6.5
  *   "2 hours 50 mins (X)"  → 2.833...
  *   "150m" / "150 Minutes" → 2.5
+ *   "45 Minutes (note)"    → 0.75  (trailing free-text notes don't break parsing)
  *   ""                     → 0
  *   "N/A"                  → 0
  *
@@ -50,6 +51,15 @@ export interface DesignerRevenue {
  * dropping the minutes on every plural "X Hours Y Minutes" entry (the
  * standard timesheet phrasing). Same reasoning applies to the minutes
  * suffix and to the standalone minutes-only pattern below.
+ *
+ * The minutes-only pattern below is intentionally NOT end-anchored. Real
+ * timesheet entries often append a free-text note after the number, e.g.
+ * "45 Minutes (I think we don't have to bill this)" — an earlier `^...$`
+ * full-string anchor rejected that as a match (the trailing note isn't part
+ * of the pattern), silently falling through to the plain-number fallback,
+ * which read the leading "45" as 45 WHOLE HOURS instead of 45 minutes — a
+ * ~60x overstatement that single-handedly explained a live "Listed: 50.3
+ * hrs" figure for a designer whose real logged time that month was ~6 hours.
  */
 export function parseHours(s: string): number {
   if (!s) return 0;
@@ -64,8 +74,8 @@ export function parseHours(s: string): number {
     return h + m / 60;
   }
 
-  // Pure minutes: "150m", "150min", or "150 Minutes"
-  const minsOnly = str.match(/^(\d+(?:\.\d+)?)\s*m(?:inutes|inute|ins|in)?\.?$/i);
+  // Pure minutes: "150m", "150min", "150 Minutes", or "150 Minutes (note)"
+  const minsOnly = str.match(/^(\d+(?:\.\d+)?)\s*m(?:inutes|inute|ins|in)?\.?/i);
   if (minsOnly) {
     return parseFloat(minsOnly[1]) / 60;
   }
@@ -171,6 +181,330 @@ export function scopeRevenueItems(
   });
 }
 
+// ── Month attribution ───────────────────────────────────────────────────────────
+
+/** A task's own "YYYY-MM", derived from its date field. Empty string if unparseable. */
+export function taskMonth(date: string): string {
+  return (date ?? '').slice(0, 7);
+}
+
+/**
+ * projectId → key → hours, from each task's own hour fields, keyed by
+ * whatever `keyOf` extracts (a month, a category, ...). Shared by
+ * computeMonthBreakdown, computeCategoryRevenue, and scopeRevenueItemsForKey
+ * so every "split a project's hours by X" computation uses the identical
+ * grouping/hour-parsing logic instead of three near-identical copies of it.
+ *
+ * Uses ONLY punchedHours (approved/billed) — no actualEfforts fallback. A
+ * task with no punched hours yet contributes 0 to any dollar-figure
+ * attribution; actualEfforts is self-reported and informational only (shown
+ * separately as "Listed"), and must never influence a revenue split. An
+ * earlier `punchedHours > 0 ? punchedHours : actualEfforts` fallback here
+ * caused Revenue Contribution to track a designer's unapproved self-reported
+ * hours instead of their approved ones whenever punchedHours was blank.
+ */
+function groupHoursByProjectAndKey(
+  tasks: Task[],
+  keyOf: (t: Task) => string,
+): Map<string, Map<string, number>> {
+  const result = new Map<string, Map<string, number>>();
+  tasks.forEach((t) => {
+    if (!t.projectId) return;
+    const key = keyOf(t);
+    if (!key) return;
+    const pid = t.projectId.trim();
+    if (!result.has(pid)) result.set(pid, new Map());
+    const kMap = result.get(pid)!;
+    const hours = parseHours(t.punchedHours);
+    kMap.set(key, (kMap.get(key) ?? 0) + hours);
+  });
+  return result;
+}
+
+export interface MonthRevenue {
+  hours: number;
+  revenue: number;
+}
+
+/**
+ * "YYYY-MM" → { hours, revenue } attributed to that month, summed across
+ * every project. Same proportional hours-share model as
+ * computeDesignerRevenue / computeCategoryRevenue, but splitting a project's
+ * revenue across the MONTHS it was worked in (derived from each task's own
+ * date field, not the project-level RevenueItem.month range) instead of
+ * designers or categories — so a project spanning "2026-08 - 2026-09" gives
+ * an August figure and a September figure that sum to its true total,
+ * instead of showing that same full total under both months.
+ */
+export function computeMonthBreakdown(
+  tasks: Task[],
+  revenueItems: RevenueItem[],
+): Map<string, MonthRevenue> {
+  const revenueByProject = new Map<string, number>();
+  revenueItems.forEach((r) => {
+    if (!r.projectId) return;
+    const pid = r.projectId.trim();
+    revenueByProject.set(pid, (revenueByProject.get(pid) ?? 0) + resolveRevenueAmount(r));
+  });
+
+  const projectMonthHours = groupHoursByProjectAndKey(tasks, (t) => taskMonth(t.date));
+
+  const totals = new Map<string, MonthRevenue>();
+  projectMonthHours.forEach((mMap, pid) => {
+    const projectRevenue = revenueByProject.get(pid) ?? 0;
+    let totalProjectHours = 0;
+    mMap.forEach((h) => { totalProjectHours += h; });
+
+    mMap.forEach((hours, month) => {
+      const share = totalProjectHours > 0 ? (hours / totalProjectHours) * projectRevenue : 0;
+      const existing = totals.get(month) ?? { hours: 0, revenue: 0 };
+      existing.hours += hours;
+      existing.revenue += share;
+      totals.set(month, existing);
+    });
+  });
+
+  return totals;
+}
+
+/**
+ * "YYYY-MM" → revenue attributed to that month. Convenience wrapper around
+ * computeMonthBreakdown for callers that only need the revenue side.
+ *
+ * Note: this is a COMPANY-WIDE total across every project — it does not
+ * compose with an active leader/category/designer filter. The Revenue page
+ * doesn't call this directly for its KPI card for that reason; it instead
+ * threads scopeRevenueItemsForMonth + filterTasksByMonth through the same
+ * pipeline every other filter already uses, so a month figure stays correct
+ * when combined with other active filters. This function is the plain
+ * unfiltered figure — useful on its own (e.g. a future "Revenue by Month"
+ * view) — and is exercised by the same underlying math either way.
+ */
+export function computeMonthRevenue(
+  tasks: Task[],
+  revenueItems: RevenueItem[],
+): Map<string, number> {
+  const map = new Map<string, number>();
+  computeMonthBreakdown(tasks, revenueItems).forEach((v, month) => map.set(month, v.revenue));
+  return map;
+}
+
+/**
+ * Returns a new RevenueItem[] where each row's totalRevenue/totalHours are
+ * scaled down to just one KEY's (a month, a category, ...) proportional
+ * hours-share — every other field (leader, category, clientName,
+ * paymentChannel, paymentMode, hourlyRate, projectId) is preserved from the
+ * original row, so any chart/table that just reads those fields keeps
+ * working unchanged, now against key-scoped totals instead of whole-project
+ * ones. `keyOf` extracts the key from a task (e.g. its month or category);
+ * `applyKey` writes the resolved key back onto the output row (e.g. setting
+ * `.month` or `.category` to match what was actually split).
+ *
+ * Shared engine behind scopeRevenueItemsForMonth and
+ * scopeRevenueItemsForCategory — same math, different dimension. Composing
+ * both sequentially (scale by month, then scale THAT result by category
+ * using tasks already limited to that month) yields the correct JOINT
+ * (month × category) share, not an independent double-count — see
+ * scopeRevenueItemsForCategory's own doc for the worked reasoning.
+ *
+ * Pair this with a matching task filter (filterTasksByMonth, or filtering by
+ * category) when feeding computeDesignerRevenue / computeCategoryRevenue for
+ * a specific key — the task list must be limited to that key too, or the
+ * hours-share denominator inside those functions would use hours OUTSIDE the
+ * selected key against this key's already-reduced revenue figure, inflating
+ * shares for whoever worked outside it and shortchanging whoever worked more
+ * heavily within it.
+ *
+ * A row for a project with zero hours under the given key is dropped
+ * entirely — nothing to attribute, same as computeMonthBreakdown silently
+ * contributing 0 rather than surfacing a $0 row.
+ *
+ * If a project has more than one revenue row, each row's revenue is scaled
+ * by the same ratio (this key's project share ÷ the project's original
+ * total revenue), preserving their relative proportions to each other.
+ *
+ * An empty `key` returns `revenueItems` unchanged — "no filter" keeps
+ * showing full, unsplit totals; there's no double-counting risk there since
+ * every project appears exactly once regardless of how many keys it spans.
+ */
+function scopeRevenueItemsForKey(
+  revenueItems: RevenueItem[],
+  tasks: Task[],
+  key: string,
+  keyOf: (t: Task) => string,
+  applyKey: (item: RevenueItem, key: string) => RevenueItem,
+): RevenueItem[] {
+  if (!key) return revenueItems;
+
+  const projectKeyHours = groupHoursByProjectAndKey(tasks, keyOf);
+  const projectOriginalRevenue = new Map<string, number>();
+  revenueItems.forEach((r) => {
+    if (!r.projectId) return;
+    const pid = r.projectId.trim();
+    projectOriginalRevenue.set(pid, (projectOriginalRevenue.get(pid) ?? 0) + resolveRevenueAmount(r));
+  });
+
+  const result: RevenueItem[] = [];
+  revenueItems.forEach((r) => {
+    if (!r.projectId) return;
+    const pid = r.projectId.trim();
+    const kMap = projectKeyHours.get(pid);
+    const keyHours = kMap?.get(key) ?? 0;
+    if (keyHours <= 0) return;
+
+    let totalProjectHours = 0;
+    kMap?.forEach((h) => { totalProjectHours += h; });
+    const originalProjectRevenue = projectOriginalRevenue.get(pid) ?? 0;
+    const keyProjectShare = totalProjectHours > 0
+      ? (keyHours / totalProjectHours) * originalProjectRevenue
+      : 0;
+
+    const rowRevenue = resolveRevenueAmount(r);
+    const revenueRatio = originalProjectRevenue > 0 ? keyProjectShare / originalProjectRevenue : 0;
+    const hoursRatio = totalProjectHours > 0 ? keyHours / totalProjectHours : 0;
+
+    result.push(applyKey({
+      ...r,
+      totalRevenue: Math.round(rowRevenue * revenueRatio * 100) / 100,
+      totalHours: Math.round((r.totalHours || 0) * hoursRatio * 100) / 100,
+    }, key));
+  });
+
+  return result;
+}
+
+/** Month-dimension instance of scopeRevenueItemsForKey — see that function for the full rationale. */
+export function scopeRevenueItemsForMonth(
+  revenueItems: RevenueItem[],
+  tasks: Task[],
+  month: string,
+): RevenueItem[] {
+  return scopeRevenueItemsForKey(
+    revenueItems, tasks, month,
+    (t) => taskMonth(t.date),
+    (item, month) => ({ ...item, month }),
+  );
+}
+
+/**
+ * Category-dimension instance of scopeRevenueItemsForKey. Fixes the same bug
+ * pattern as the month split: the backend's syncRevenue() stamps each
+ * project with only the FIRST task category it saw, so selecting e.g.
+ * "Graphic Design" on a project that also has Web Design/IT Operations hours
+ * used to show that project's FULL revenue (project-inclusion), not just
+ * Graphic Design's ~4% share. This scales it down to the real share instead.
+ *
+ * To compose correctly with an already-active month filter, pass tasks
+ * already limited to that month (e.g. via filterTasksByMonth) rather than
+ * the full task list — that makes the category split's "total project hours"
+ * denominator mean "hours within the selected month," so scaling this
+ * function's OUTPUT sequentially after scopeRevenueItemsForMonth's yields the
+ * correct joint (month × category) share: revenue × (hoursInMonth/hoursEver)
+ * × (hoursInCategoryWithinMonth/hoursInMonth) = revenue ×
+ * hoursInCategoryWithinMonth/hoursEver, not a double-discount.
+ */
+export function scopeRevenueItemsForCategory(
+  revenueItems: RevenueItem[],
+  tasks: Task[],
+  category: string,
+): RevenueItem[] {
+  return scopeRevenueItemsForKey(
+    revenueItems, tasks, category,
+    (t) => t.category,
+    (item, category) => ({ ...item, category }),
+  );
+}
+
+/**
+ * Tasks whose own date falls in the given month — pairs with
+ * scopeRevenueItemsForMonth so an attribution function fed both uses the
+ * right hours denominator for that month. An empty month returns tasks
+ * unchanged (matching scopeRevenueItemsForMonth's "All Months" behavior).
+ */
+export function filterTasksByMonth(tasks: Task[], month: string): Task[] {
+  if (!month) return tasks;
+  return tasks.filter((t) => taskMonth(t.date) === month);
+}
+
+/**
+ * Date-range counterpart to scopeRevenueItemsForMonth/Category — proportionally
+ * splits each project's revenue by whatever share of its (punchedHours-only)
+ * hours fall inside an inclusive [startDateKey, endDateKey] window
+ * ("YYYY-MM-DD" strings, comparable lexicographically), instead of a fixed
+ * calendar month or category. This is what lets the designer-detail
+ * section's "View by" control (Day/Week/Month/Year) drive Revenue
+ * Contribution and the Audit table the same way scopeRevenueItemsForMonth
+ * already drives the Month view — same proportional-hours-share math,
+ * generalized to any window instead of hardcoded to month boundaries.
+ *
+ * NOT implemented via scopeRevenueItemsForKey/groupHoursByProjectAndKey:
+ * those key a task by a value that's ALWAYS present (every task has some
+ * month, some category), so summing across every key naturally reconstructs
+ * a project's true total hours. A window is a binary in/out split — an
+ * out-of-window task has no key at all — so it would vanish from that total
+ * entirely instead of correctly counting toward "hours outside this window."
+ * This computes the true all-time total directly instead.
+ *
+ * Takes plain date-key strings (not Date objects) so this file never needs
+ * to import the date-range helpers from lib/productivity.ts — that module
+ * already imports parseHours from here, and a two-way import would create a
+ * circular dependency between the two.
+ */
+export function scopeRevenueItemsForDateRange(
+  revenueItems: RevenueItem[],
+  tasks: Task[],
+  startDateKey: string,
+  endDateKey: string,
+): RevenueItem[] {
+  const inWindow = (t: Task) => {
+    const raw = (t.date ?? '').slice(0, 10);
+    return !!raw && raw >= startDateKey && raw <= endDateKey;
+  };
+
+  const projectTotalHours = new Map<string, number>();
+  const projectWindowHours = new Map<string, number>();
+  tasks.forEach((t) => {
+    if (!t.projectId) return;
+    const pid = t.projectId.trim();
+    const hours = parseHours(t.punchedHours);
+    projectTotalHours.set(pid, (projectTotalHours.get(pid) ?? 0) + hours);
+    if (inWindow(t)) {
+      projectWindowHours.set(pid, (projectWindowHours.get(pid) ?? 0) + hours);
+    }
+  });
+
+  const projectOriginalRevenue = new Map<string, number>();
+  revenueItems.forEach((r) => {
+    if (!r.projectId) return;
+    const pid = r.projectId.trim();
+    projectOriginalRevenue.set(pid, (projectOriginalRevenue.get(pid) ?? 0) + resolveRevenueAmount(r));
+  });
+
+  const result: RevenueItem[] = [];
+  revenueItems.forEach((r) => {
+    if (!r.projectId) return;
+    const pid = r.projectId.trim();
+    const windowHours = projectWindowHours.get(pid) ?? 0;
+    if (windowHours <= 0) return; // nothing to attribute in this window
+
+    const totalHours = projectTotalHours.get(pid) ?? 0;
+    const originalProjectRevenue = projectOriginalRevenue.get(pid) ?? 0;
+    const windowShare = totalHours > 0 ? (windowHours / totalHours) * originalProjectRevenue : 0;
+
+    const rowRevenue = resolveRevenueAmount(r);
+    const revenueRatio = originalProjectRevenue > 0 ? windowShare / originalProjectRevenue : 0;
+    const hoursRatio = totalHours > 0 ? windowHours / totalHours : 0;
+
+    result.push({
+      ...r,
+      totalRevenue: Math.round(rowRevenue * revenueRatio * 100) / 100,
+      totalHours: Math.round((r.totalHours || 0) * hoursRatio * 100) / 100,
+    });
+  });
+
+  return result;
+}
+
 // ── Core attribution ──────────────────────────────────────────────────────────
 
 /**
@@ -228,10 +562,9 @@ export function computeDesignerRevenue(
       leaderCounts: new Map(),
     };
 
-    // Prefer punchedHours; fall back to actualEfforts if empty/zero
-    const ph = parseHours(t.punchedHours);
-    const ae = parseHours(t.actualEfforts);
-    existing.hours += ph > 0 ? ph : ae;
+    // ONLY punchedHours (approved/billed) — see groupHoursByProjectAndKey's
+    // doc above for why actualEfforts must never feed a dollar figure.
+    existing.hours += parseHours(t.punchedHours);
 
     if (t.teamLeader) {
       existing.leaderCounts.set(
@@ -349,16 +682,7 @@ export function computeCategoryRevenue(
   });
 
   // projectId → category → hours
-  const projectMap = new Map<string, Map<string, number>>();
-  tasks.forEach((t) => {
-    if (!t.category || !t.projectId) return;
-    const pid = t.projectId.trim();
-    if (!projectMap.has(pid)) projectMap.set(pid, new Map());
-    const cMap = projectMap.get(pid)!;
-    const ph = parseHours(t.punchedHours);
-    const ae = parseHours(t.actualEfforts);
-    cMap.set(t.category, (cMap.get(t.category) ?? 0) + (ph > 0 ? ph : ae));
-  });
+  const projectMap = groupHoursByProjectAndKey(tasks, (t) => t.category);
 
   const totals = new Map<string, { revenue: number; hours: number }>();
   projectMap.forEach((cMap, pid) => {

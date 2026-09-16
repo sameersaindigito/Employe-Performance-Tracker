@@ -1,36 +1,33 @@
 import { useMemo } from 'react';
 import { useAppContext } from '../../context/AppContext';
-import { computeDesignerRevenue, scopeRevenueItems } from '../../lib/revenueAttribution';
+import { computeProductivityMap } from '../../lib/productivity';
+import { computeWeightedDesignerScore, PRODUCTIVITY_ELIGIBILITY_FLOOR } from '../../lib/designerOfMonth';
 import { isClientLost } from '../../lib/ratings';
 import { Card } from '../ui/Card';
-import { Monitor, Star, ClipboardList, Users, DollarSign } from 'lucide-react';
+import { Monitor, Star, ClipboardList, Users, Gauge } from 'lucide-react';
 
-// ── Scoring weights (tune these without touching the algorithm) ───────────────
-const RATING_WEIGHT  = 0.6;
-const REVENUE_WEIGHT = 0.4;
-
-const MIN_TASKS = 3;
+/** "YYYY-MM" filter value -> a Date anchored to that month, for productivity's period math. */
+function monthToDate(month: string): Date {
+  if (!month) return new Date();
+  const [y, m] = month.split('-').map(Number);
+  return new Date(y, (m || 1) - 1, 1);
+}
 
 export function ITOperationsChampion() {
-  const { tasks, allTasks, filters, loading, revenueItems } = useAppContext();
+  const { tasks, filters, loading } = useAppContext();
 
-  // Revenue scoped to the month/category being awarded; hours denominators come
-  // from allTasks so each project's total hours stay whole.
-  const scopedRevenue = useMemo(
-    () => scopeRevenueItems(revenueItems, { month: filters.month, category: filters.category }),
-    [revenueItems, filters.month, filters.category],
-  );
+  // Stays a MONTHLY award (Part 4), anchored to whichever month the
+  // Dashboard's Month filter has selected — same convention as DOTM.
+  const reference = useMemo(() => monthToDate(filters.month), [filters.month]);
 
   const champion = useMemo(() => {
     // 1. Filter to IT Operations tasks only
     const itTasks = tasks.filter((t) => t.category === 'IT Operations');
     if (itTasks.length === 0) return null;
 
-    // 2. Pre-compute revenue contributions from the FULL task list
-    const revenueMap = new Map<string, number>();
-    computeDesignerRevenue(allTasks, scopedRevenue).forEach((r) => {
-      revenueMap.set(r.designerName, r.revenueContribution);
-    });
+    // 2. Productivity from the FULL filtered task list — a holistic measure
+    // of each designer's own capacity utilization, not category-restricted.
+    const productivityMap = computeProductivityMap(tasks, 'monthly', reference);
 
     // 3. Group by designerName
     const designerMap = new Map<string, {
@@ -67,22 +64,28 @@ export function ITOperationsChampion() {
       designerMap.set(t.designerName, entry);
     });
 
-    // 4. Build candidates list (min tasks + rated)
+    // 4. Build candidates list: category membership (guaranteed by grouping
+    // from itTasks), not Client Lost, and Productivity strictly above the
+    // eligibility floor. No task-count or rating minimum.
     type Candidate = {
       name: string;
-      avgRating: number;
+      avgRating: number | null;
       totalTasks: number;
       teamLeader: string;
-      revenue: number;
+      productivity: number;
     };
     const candidates: Candidate[] = [];
 
     designerMap.forEach((data, name) => {
       // Client Lost designers are ineligible for the award, per spec.
       if (data.hasClientLost) return;
-      if (data.totalTasks < MIN_TASKS) return;
-      if (data.ratedCount === 0) return;
-      const avgRating = data.ratingSum / data.ratedCount;
+
+      const productivity = productivityMap.get(name) ?? 0;
+      if (productivity <= PRODUCTIVITY_ELIGIBILITY_FLOOR) return;
+
+      // A designer may have zero rated tasks — no rating floor anymore, so
+      // this doesn't disqualify them; they score with a 0 Rating component.
+      const avgRating = data.ratedCount > 0 ? data.ratingSum / data.ratedCount : null;
 
       let primaryLeader = '';
       let maxCount = 0;
@@ -95,22 +98,19 @@ export function ITOperationsChampion() {
         avgRating,
         totalTasks: data.totalTasks,
         teamLeader: primaryLeader,
-        revenue: revenueMap.get(name) ?? 0,
+        productivity,
       });
     });
 
     if (candidates.length === 0) return null;
 
-    // 5. Compute 2-factor weighted score
-    const maxRevenue = Math.max(...candidates.map((c) => c.revenue));
+    // 5. Compute the shared 2-factor weighted score (same formula as DOTM/Leaderboard)
+    const maxProductivity = Math.max(...candidates.map((c) => c.productivity));
 
     let winner: (Candidate & { weightedScore: number }) | null = null;
 
     candidates.forEach((c) => {
-      const normalizedRevenue = maxRevenue > 0 ? (c.revenue / maxRevenue) * 5 : 0;
-      const weightedScore =
-        c.avgRating  * RATING_WEIGHT +
-        normalizedRevenue * REVENUE_WEIGHT;
+      const weightedScore = computeWeightedDesignerScore(c.avgRating ?? 0, c.productivity, maxProductivity);
 
       if (!winner || weightedScore > winner.weightedScore) {
         winner = { ...c, weightedScore };
@@ -118,7 +118,7 @@ export function ITOperationsChampion() {
     });
 
     return winner as (Candidate & { weightedScore: number }) | null;
-  }, [tasks, allTasks, scopedRevenue]);
+  }, [tasks, reference]);
 
   if (loading) {
     return (
@@ -137,10 +137,10 @@ export function ITOperationsChampion() {
           IT Operations Champion
         </p>
         <p className="text-[#F0F0F5] text-sm font-medium mb-1">
-          No eligible IT Operations designer
+          No eligible IT Operations Champion
         </p>
         <p className="text-[#8B8B9E] text-xs">
-          Minimum 3 tasks required
+          IT Operations category · Client Lost designers ineligible · Productivity must be above {PRODUCTIVITY_ELIGIBILITY_FLOOR}% · highest Rating + Productivity wins
         </p>
       </Card>
     );
@@ -172,20 +172,18 @@ export function ITOperationsChampion() {
             <div className="flex items-center gap-1.5 text-amber-400">
               <Star size={14} fill="currentColor" />
               <span className="text-sm font-semibold">
-                {champion.avgRating.toFixed(2)} / 5
+                {champion.avgRating !== null ? `${champion.avgRating.toFixed(2)} / 5` : 'N/A'}
               </span>
               <span className="text-[#8B8B9E] text-xs font-normal">avg</span>
             </div>
 
-            {champion.revenue > 0 && (
-              <div className="flex items-center gap-1.5 text-emerald-400">
-                <DollarSign size={14} />
-                <span className="text-sm font-semibold">
-                  ${champion.revenue.toLocaleString(undefined, { maximumFractionDigits: 0 })}
-                </span>
-                <span className="text-[#8B8B9E] text-xs font-normal">contrib.</span>
-              </div>
-            )}
+            <div className="flex items-center gap-1.5 text-emerald-400">
+              <Gauge size={14} />
+              <span className="text-sm font-semibold">
+                {champion.productivity.toFixed(0)}%
+              </span>
+              <span className="text-[#8B8B9E] text-xs font-normal">productivity</span>
+            </div>
 
             <div className="flex items-center gap-1.5 text-[#8B8B9E]">
               <ClipboardList size={14} />

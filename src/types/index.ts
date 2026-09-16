@@ -52,7 +52,8 @@ export interface DesignerStats {
   totalTasks: number;
   averageRating: number | null;
   weightedScore: number | null;
-  eligible: boolean;
+  /** Productivity % (billed hours ÷ period capacity × 100) that fed weightedScore, for display/spot-checking. */
+  productivityPct: number | null;
   status: 'Excellent' | 'Good' | 'Average' | 'Needs Improvement' | 'No Rating';
 }
 
