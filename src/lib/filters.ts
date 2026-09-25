@@ -1,4 +1,5 @@
 import type { Task, FilterState } from '../types';
+import { isPlausibleMonth } from './dateSanity';
 
 export function applyClientFilters(tasks: Task[], filters: FilterState): Task[] {
   return tasks.filter((task) => {
@@ -33,6 +34,7 @@ export function getUniqueCategories(tasks: Task[]): string[] {
 }
 
 export function getAvailableMonths(tasks: Task[]): string[] {
-  const months = [...new Set(tasks.map((t) => t.date?.slice(0, 7)).filter(Boolean))];
+  const months = [...new Set(tasks.map((t) => t.date?.slice(0, 7)).filter(Boolean))]
+    .filter((m) => isPlausibleMonth(m));
   return months.sort().reverse();
 }

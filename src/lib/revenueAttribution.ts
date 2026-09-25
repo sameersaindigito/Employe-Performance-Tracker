@@ -114,19 +114,61 @@ export function resolveRevenueAmount(item: RevenueItem): number {
 }
 
 /**
+ * The spreadsheet's own timezone — IST (UTC+5:30), no DST. Confirmed live:
+ * every RevenueItem.month value that arrives as a full ISO timestamp carries
+ * exactly this offset (e.g. "...T18:30:00.000Z", which is midnight IST on
+ * the FOLLOWING calendar day) — see normalizeMonthValue below for why this
+ * matters.
+ */
+const SHEET_TIMEZONE_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+/**
  * Extracts a clean "YYYY-MM" prefix from a raw month value, tolerating a full
- * ISO datetime string (e.g. "2026-07-31T18:30:00.000Z") in place of the
+ * ISO datetime string (e.g. "2026-08-31T18:30:00.000Z") in place of the
  * expected "YYYY-MM" — seen in real data, most likely a date-formatted sheet
- * cell serialized as a timestamp instead of plain text. Left unnormalized,
- * two different raw representations of the same real month (e.g. "2026-07"
- * and "2026-07-31T18:30:00.000Z") would be treated as distinct values and
- * both happen to format to the same "Jul 2026" label — producing a duplicate
- * dropdown entry without ever comparing equal to the clean value elsewhere.
- * Falls back to the trimmed raw value for anything that doesn't look like a
- * date at all, so unrecognized values don't just silently vanish.
+ * cell serialized as a Date object (Apps Script's JSON response converts a
+ * Date cell to its UTC-equivalent ISO instant) instead of plain "YYYY-MM" text.
+ *
+ * CRITICAL: naively taking the UTC date's own "YYYY-MM" prefix is WRONG for
+ * these timestamps. The spreadsheet is authored in IST (UTC+5:30); a cell
+ * meaning "September 2026" serializes as local midnight on Sep 1 IST, which
+ * in UTC is "2026-08-31T18:30:00.000Z" — a raw prefix read gives "2026-08",
+ * silently mislabeling every row as the PRIOR month. Confirmed live: with
+ * the spreadsheet now containing only September 2026 data, every single
+ * revenue row's month value showed this exact "...-08-31T18:30..." pattern,
+ * making "Sep 2026" vanish from the dropdown entirely in favor of a "Aug
+ * 2026" option with zero real September rows behind it once a specific
+ * month was selected ("All Months" looked fine regardless, since it doesn't
+ * filter by this mislabeled value at all).
+ *
+ * Fixed by converting the UTC instant to IST (add the spreadsheet's fixed
+ * UTC+5:30 offset) BEFORE reading off the calendar date — this is the
+ * correct, general timezone conversion, not a narrow pattern match on
+ * "18:30" specifically, so it's right for a timestamp at any time of day.
+ * Uses the UTC getters on the shifted Date so the result doesn't also pick
+ * up whatever local timezone the code happens to be running in.
+ *
+ * Left unnormalized, two different raw representations of the same real
+ * month (e.g. "2026-09" and "2026-08-31T18:30:00.000Z") would be treated as
+ * distinct values and — before this fix — even format to two DIFFERENT
+ * incorrect labels, multiplying the confusion. Falls back to the trimmed
+ * raw value for anything that doesn't look like a date at all, so
+ * unrecognized values don't just silently vanish.
  */
 function normalizeMonthValue(raw: string): string {
   const trimmed = raw.trim();
+
+  const isoTimestamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(trimmed);
+  if (isoTimestamp) {
+    const utcInstant = new Date(trimmed);
+    if (!isNaN(utcInstant.getTime())) {
+      const localInstant = new Date(utcInstant.getTime() + SHEET_TIMEZONE_OFFSET_MS);
+      const y = localInstant.getUTCFullYear();
+      const m = String(localInstant.getUTCMonth() + 1).padStart(2, '0');
+      return `${y}-${m}`;
+    }
+  }
+
   const match = trimmed.match(/^(\d{4}-\d{2})/);
   return match ? match[1] : trimmed;
 }

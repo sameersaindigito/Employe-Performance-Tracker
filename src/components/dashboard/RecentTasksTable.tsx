@@ -3,6 +3,7 @@ import { useAppContext } from '../../context/AppContext';
 import { Card } from '../ui/Card';
 import { Table, Thead, Tbody, Th, Td } from '../ui/Table';
 import { Badge } from '../ui/Badge';
+import { isPlausibleMonth } from '../../lib/dateSanity';
 import { ExternalLink } from 'lucide-react';
 
 function formatDate(dateStr: string) {
@@ -77,7 +78,7 @@ export function RecentTasksTable() {
     const keys = new Set<string>();
     tasks.forEach((task) => {
       const key = getMonthKey(task.date);
-      if (key) keys.add(key);
+      if (key && isPlausibleMonth(key)) keys.add(key);
     });
     return [...keys].sort((a, b) => b.localeCompare(a));
   }, [tasks]);

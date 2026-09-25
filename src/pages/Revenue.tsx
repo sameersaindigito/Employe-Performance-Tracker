@@ -10,6 +10,7 @@ import {
   filterTasksByMonth,
   parseMonthRange,
 } from '../lib/revenueAttribution';
+import { isPlausibleMonth } from '../lib/dateSanity';
 import { PageShell } from '../components/layout/PageShell';
 import { Card } from '../components/ui/Card';
 import { DesignerDetailSection } from '../components/shared/DesignerDetailSection';
@@ -55,18 +56,23 @@ function formatMonth(m: string): string {
 }
 
 /**
- * Returns the most recent YYYY-MM found in a list of RevenueItems, or '' if
- * empty. A row's month may be a range ("2026-07 - 2026-09") rather than a
- * single value — the END of the range is what determines recency, so this
- * uses parseMonthRange rather than comparing raw strings (a raw-string
+ * Returns the most recent PLAUSIBLE YYYY-MM found in a list of RevenueItems,
+ * or '' if empty. A row's month may be a range ("2026-07 - 2026-09") rather
+ * than a single value — the END of the range is what determines recency, so
+ * this uses parseMonthRange rather than comparing raw strings (a raw-string
  * comparison would judge a "2026-06 - 2026-09" row as older than a plain
  * "2026-08" row, even though the range actually extends past it).
+ *
+ * Skips implausibly-far-future ends (see dateSanity.ts) — a single row whose
+ * range end reflects a garbage far-future task date (e.g. "2026-09 - 2029-09")
+ * would otherwise become the default month, defaulting the whole page to a
+ * period with zero real data.
  */
 function getMostRecentRevenueMonth(items: RevenueItem[]): string {
   let best = '';
   for (const r of items) {
     const { end } = parseMonthRange(r.month);
-    if (end && end > best) best = end;
+    if (end && isPlausibleMonth(end) && end > best) best = end;
   }
   return best;
 }
@@ -357,8 +363,11 @@ export function Revenue() {
     const months = new Set<string>();
     allRevenueData.forEach((r) => {
       const { start, end } = parseMonthRange(r.month);
-      if (start) months.add(start);
-      if (end) months.add(end);
+      // Each bound is checked independently — a row like "2026-09 - 2029-09"
+      // has a perfectly real start; only the implausible-future end (see
+      // dateSanity.ts) should be dropped, not the whole row.
+      if (start && isPlausibleMonth(start)) months.add(start);
+      if (end && isPlausibleMonth(end)) months.add(end);
     });
     return [...months].sort().reverse();
   }, [allRevenueData]);

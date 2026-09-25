@@ -11,6 +11,7 @@ import {
 import type { Task, FilterState, RevenueItem } from '../types';
 import { fetchTasks, fetchRevenue, triggerSync } from '../lib/api';
 import { applyClientFilters } from '../lib/filters';
+import { isPlausibleMonth } from '../lib/dateSanity';
 
 interface AppContextValue {
   /** Filtered dataset — used by all display components (charts, KPIs, leaderboard) */
@@ -37,12 +38,17 @@ interface AppContextValue {
   lastUpdated: Date | null;
 }
 
-/** Derive the most recent month present in a task list. Returns '' if list is empty. */
+/**
+ * Derive the most recent PLAUSIBLE month present in a task list. Returns ''
+ * if list is empty. Skips implausibly-far-future dates (see dateSanity.ts) —
+ * without this, a single garbage row (e.g. a test entry dated years ahead)
+ * could make the Dashboard default to a month with zero real data in it.
+ */
 function getMostRecentDataMonth(tasks: Task[]): string {
   let best = '';
   for (const t of tasks) {
     const m = t.date?.slice(0, 7);
-    if (m && m > best) best = m;
+    if (m && isPlausibleMonth(m) && m > best) best = m;
   }
   return best;
 }
@@ -106,9 +112,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     loadAllTasks(true); // isFirstLoad=true → sets default month from data
   }, [loadAllTasks]);
 
-  // Auto-refresh every 5 minutes — re-fetches the complete dataset
+  // Auto-refresh every hour — re-fetches the complete dataset
   useEffect(() => {
-    intervalRef.current = setInterval(loadAllTasks, 5 * 60 * 1000);
+    intervalRef.current = setInterval(loadAllTasks, 60 * 60 * 1000);
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
